@@ -25,6 +25,7 @@ using System.Security;
 using System.Diagnostics;
 using System.Threading.Tasks;
 using WPCordovaClassLib.Cordova.JSON;
+using System.Reflection;
 
 namespace WPCordovaClassLib.Cordova.Commands
 {
@@ -246,77 +247,19 @@ namespace WPCordovaClassLib.Cordova.Commands
             }
         }
 
-        /// Helper method to copy all relevant cookies from the WebBrowser control into a header on
-        /// the HttpWebRequest
+        /// <summary>
+        /// Create a new web request sharing it's cookie store with the browser.
+        /// Note that this makes it impossible to set cookies on the request itself.
         /// </summary>
-        /// <param name="browser">The source browser to copy the cookies from</param>
-        /// <param name="webRequest">The destination HttpWebRequest to add the cookie header to</param>
-        /// <returns>Nothing</returns>
-        private async Task CopyCookiesFromWebBrowser(HttpWebRequest webRequest)
+        /// <param name="serverUri">The URI to make the request for</param>
+        /// <returns>The new request</returns>
+        private HttpWebRequest CreateHttpWebRequest(String serverUri)
         {
-            var tcs = new TaskCompletionSource<object>();
+            // See also http://stackoverflow.com/questions/4212713/grabbing-cookies-in-web-browser-control-wp7
+            PropertyInfo browserHttp = typeof(System.Net.Browser.WebRequestCreator).GetProperty("BrowserHttp");
+            var requestFactory = browserHttp.GetValue(this.browser, null) as IWebRequestCreate;
 
-            // Accessing WebBrowser needs to happen on the UI thread
-            Deployment.Current.Dispatcher.BeginInvoke(() =>
-            {
-                // Get the WebBrowser control
-                if (this.browser == null)
-                {
-                    PhoneApplicationFrame frame = Application.Current.RootVisual as PhoneApplicationFrame;
-                    if (frame != null)
-                    {
-                        PhoneApplicationPage page = frame.Content as PhoneApplicationPage;
-                        if (page != null)
-                        {
-                            CordovaView cView = page.FindName("CordovaView") as CordovaView;
-                            if (cView != null)
-                            {
-                                this.browser = cView.Browser;
-                            }
-                        }
-                    }
-                }
-
-                try
-                {
-                    // Only copy the cookies if the scheme and host match (to avoid any issues with secure/insecure cookies)
-                    // NOTE: since the returned CookieCollection appears to munge the original cookie's domain value in favor of the actual Source domain,
-                    // we can't know for sure whether the cookies would be applicable to any other hosts, so best to play it safe and skip for now.
-                    if (this.browser != null && this.browser.Source.IsAbsoluteUri == true &&
-                        this.browser.Source.Scheme == webRequest.RequestUri.Scheme && this.browser.Source.Host == webRequest.RequestUri.Host)
-                    {
-                        string cookieHeader = "";
-                        string requestPath = webRequest.RequestUri.PathAndQuery;
-                        CookieCollection cookies = this.browser.GetCookies();
-
-                        // Iterate over the cookies and add to the header
-                        foreach (Cookie cookie in cookies)
-                        {
-                            // Check that the path is allowed, first
-                            // NOTE: Path always seems to be empty for now, even if the cookie has a path set by the server.
-                            if (cookie.Path.Length == 0 || requestPath.IndexOf(cookie.Path, StringComparison.InvariantCultureIgnoreCase) == 0)
-                            {
-                                cookieHeader += cookie.Name + "=" + cookie.Value + "; ";
-                            }
-                        }
-
-                        // Finally, set the header if we found any cookies
-                        if (cookieHeader.Length > 0)
-                        {
-                            webRequest.Headers["Cookie"] = cookieHeader;
-                        }
-                    }
-                }
-                catch (Exception)
-                {
-                    // Swallow the exception
-                }
-
-                // Complete the task
-                tcs.SetResult(Type.Missing);
-            });
-
-            await tcs.Task;
+            return (HttpWebRequest)requestFactory.Create(new Uri(serverUri));
         }
 
         /// <summary>
@@ -380,16 +323,7 @@ namespace WPCordovaClassLib.Cordova.Commands
                 }
 
                 Uri serverUri;
-                try
-                {
-                    serverUri = new Uri(uploadOptions.Server);
-                }
-                catch (Exception)
-                {
-                    DispatchCommandResult(new PluginResult(PluginResult.Status.ERROR, new FileTransferError(InvalidUrlError, uploadOptions.Server, null, 0)));
-                    return;
-                }
-                webRequest = (HttpWebRequest)WebRequest.Create(serverUri);
+                webRequest = CreateHttpWebRequest(uploadOptions.Server);
                 webRequest.ContentType = "multipart/form-data; boundary=" + Boundary;
                 webRequest.Method = uploadOptions.Method;
 
@@ -397,20 +331,6 @@ namespace WPCordovaClassLib.Cordova.Commands
                 InProcDownloads[uploadOptions.Id] = reqState;
                 reqState.options = uploadOptions;
                 reqState.request = webRequest;
-
-                try
-                {
-                    // Associate cookies with the request
-                    // This is an async call, so we need to await it in order to preserve proper control flow
-                    Task cookieTask = CopyCookiesFromWebBrowser(webRequest);
-                    cookieTask.Wait();
-                }
-                catch (AggregateException ae)
-                {
-                    DispatchCommandResult(new PluginResult(PluginResult.Status.ERROR,
-                        new FileTransferError(FileTransfer.ConnectionError, uploadOptions.FilePath, uploadOptions.Server, 0, ae.InnerException.Message)));
-                    return;
-                }
 
                 if (!string.IsNullOrEmpty(uploadOptions.Headers))
                 {
@@ -426,9 +346,17 @@ namespace WPCordovaClassLib.Cordova.Commands
 
                 webRequest.BeginGetRequestStream(uploadCallback, reqState);
             }
-            catch (Exception /*ex*/)
+            catch (Exception ex)
             {
-                DispatchCommandResult(new PluginResult(PluginResult.Status.ERROR, new FileTransferError(ConnectionError)),callbackId);
+                // These can be thrown by the Uri constructor
+                if (ex is UriFormatException || ex is NotSupportedException || ex is ArgumentNullException)
+                {
+                    DispatchCommandResult(new PluginResult(PluginResult.Status.ERROR, new FileTransferError(InvalidUrlError, uploadOptions.Server, null, 0)));
+                }
+                else
+                {
+                    DispatchCommandResult(new PluginResult(PluginResult.Status.ERROR, new FileTransferError(ConnectionError)),callbackId);
+                }
             }
         }
 
@@ -572,7 +500,7 @@ namespace WPCordovaClassLib.Cordova.Commands
                 {
                     // otherwise it is web-bound, we will actually download it
                     //Debug.WriteLine("Creating WebRequest for url : " + downloadOptions.Url);
-                    webRequest = (HttpWebRequest)WebRequest.Create(downloadOptions.Url);
+                    webRequest = CreateHttpWebRequest(downloadOptions.Url);
                 }
             }
             catch (Exception /*ex*/)
@@ -588,20 +516,6 @@ namespace WPCordovaClassLib.Cordova.Commands
                 state.options = downloadOptions;
                 state.request = webRequest;
                 InProcDownloads[downloadOptions.Id] = state;
-
-                try
-                {
-                    // Associate cookies with the request
-                    // This is an async call, so we need to await it in order to preserve proper control flow
-                    Task cookieTask = CopyCookiesFromWebBrowser(webRequest);
-                    cookieTask.Wait();
-                }
-                catch (AggregateException ae) 
-                {
-                    DispatchCommandResult(new PluginResult(PluginResult.Status.ERROR,
-                        new FileTransferError(FileTransfer.ConnectionError, downloadOptions.Url, downloadOptions.FilePath, 0, ae.InnerException.Message)));
-                    return;
-                }
 
                 if (!string.IsNullOrEmpty(downloadOptions.Headers))
                 {
